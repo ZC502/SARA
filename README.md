@@ -7,6 +7,8 @@ SARA is a "pre-execution" logic auditing plugin designed exclusively for high-au
 
 Before an Agent performs any irreversible action (such as database deletion, message sending, or permission modification), SARA previews the divergent consequences of different execution sequences. Once systemic risks caused by intent conflicts or role drift are detected, SARA will immediately trigger a **logic fuse** to protect the underlying system from "semantic pollution" and crashes resulting from complex interactions.
 
+![blown](sara_readme_hero_fuse_blown.png)
+
 # 🚀 Key Features
 - **Logic Circuit Breaking**:Intercept mutually exclusive instructions with high order sensitivity in real time to prevent the Agent from falling into an infinite loop or executing incorrect paths.
 - **Sequential Audit**: Based on the SIPA Core engine, calculate the algebraic residuals of intent flows in the state space to quantitatively evaluate collaboration conflicts.
