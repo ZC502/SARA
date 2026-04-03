@@ -2,7 +2,7 @@
 SIPA Core - Logical Residual Auditor
 ===================================
 
-Alpha-purpose residual engine for SARA/SIPA.
+Alpha-purpose residual engine for SARA / SIPA Core.
 
 Core idea
 ---------
@@ -11,15 +11,13 @@ the execution order of intents is swapped.
 
     R_logic = d( Φ(s, A, B), Φ(s, B, A) )
 
-This file intentionally stays framework-agnostic:
+Design goals
+------------
+- framework-agnostic
 - no OpenClaw dependency
 - no LLM dependency
 - stdlib only
-
-It is designed to be used first by:
-1. unit tests
-2. disaster demos
-3. adapters/openclaw/*
+- easy to plug into demos first, adapters later
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import copy
-import math
+import posixpath
 import re
 
 
@@ -80,6 +78,7 @@ class LogicalResidualReport:
     logical_residual: float
     severity: str
     reasons: List[str]
+    actionable_advice: List[str]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -151,12 +150,75 @@ def _norm_action(action: str) -> str:
     return aliases.get(action, action)
 
 
+def _normalize_resource_path(resource: str) -> str:
+    """
+    Normalize resource paths conservatively using POSIX rules.
+
+    Examples:
+    - "/data/logs/" -> "/data/logs"
+    - "data/logs"   -> "/data/logs"
+    - ""            -> "unknown"
+    """
+    if not resource:
+        return "unknown"
+
+    text = str(resource).strip().strip('"').strip("'")
+    if text in {".", "", "unknown"}:
+        return "unknown"
+
+    if "://" in text:
+        return text.rstrip("/") or text
+
+    normalized = posixpath.normpath(text)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+
+    return normalized
+
+
+def _same_parent_path(a: str, b: str) -> bool:
+    if a == "unknown" or b == "unknown":
+        return False
+    return posixpath.dirname(a) == posixpath.dirname(b)
+
+
+def _is_ancestor_or_descendant(a: str, b: str) -> bool:
+    """
+    True if a contains b or b contains a at directory boundaries.
+    Avoids false positives like /data vs /data1.
+    """
+    if a == "unknown" or b == "unknown":
+        return False
+    if a == b:
+        return False
+
+    a_prefix = a.rstrip("/") + "/"
+    b_prefix = b.rstrip("/") + "/"
+    return a_prefix.startswith(b_prefix) or b_prefix.startswith(a_prefix)
+
+
+def _resource_relation_label(a: str, b: str) -> str:
+    if a == "unknown" or b == "unknown":
+        return "none"
+    if a == b:
+        return "same"
+    if _is_ancestor_or_descendant(a, b):
+        return "hierarchical"
+    if _same_parent_path(a, b):
+        return "sibling"
+    return "none"
+
+
 def _resource_from_match(groups: Tuple[str, ...]) -> Tuple[str, Optional[str]]:
     if not groups:
         return "unknown", None
     if len(groups) == 1:
-        return groups[0].strip('"').strip("'"), None
-    return groups[0].strip('"').strip("'"), groups[1].strip('"').strip("'")
+        return _normalize_resource_path(groups[0]), None
+    resource = _normalize_resource_path(groups[0])
+    target = groups[1].strip('"').strip("'")
+    if "://" not in target:
+        target = _normalize_resource_path(target)
+    return resource, target
 
 
 def _parse_intent_string(text: str) -> Intent:
@@ -241,6 +303,9 @@ def normalize_intent(intent: IntentLike) -> Intent:
     if isinstance(intent, Intent):
         normalized = copy.deepcopy(intent)
         normalized.action = _norm_action(normalized.action)
+        normalized.resource = _normalize_resource_path(normalized.resource)
+        if normalized.target and "://" not in normalized.target:
+            normalized.target = _normalize_resource_path(normalized.target)
         normalized.destructive = normalized.destructive or normalized.action == "delete"
         return normalized
 
@@ -248,11 +313,16 @@ def normalize_intent(intent: IntentLike) -> Intent:
         return _parse_intent_string(intent)
 
     if isinstance(intent, dict):
+        resource = _normalize_resource_path(intent.get("resource", "unknown"))
+        target = intent.get("target")
+        if target and "://" not in str(target):
+            target = _normalize_resource_path(str(target))
+
         normalized = Intent(
             actor=intent.get("actor", "unknown"),
             action=_norm_action(intent.get("action", "unknown")),
-            resource=intent.get("resource", "unknown"),
-            target=intent.get("target"),
+            resource=resource,
+            target=target,
             role=intent.get("role"),
             tool=intent.get("tool"),
             content=intent.get("content"),
@@ -282,6 +352,15 @@ class FastPredictor:
     - action side-effect divergence
     """
 
+    _ACTION_TOKEN_COST = {
+        "delete": 190,
+        "backup": 165,
+        "rename": 135,
+        "write": 145,
+        "read": 80,
+        "unknown": 110,
+    }
+
     def clone_context(self, context: Optional[Context]) -> Context:
         if context is None:
             context = {}
@@ -291,6 +370,25 @@ class FastPredictor:
         cloned.setdefault("tokens_used", 0)
         cloned.setdefault("max_window", 16000)
         return cloned
+
+    def estimate_token_cost(self, intent: Intent) -> int:
+        """
+        Dynamic but deterministic token estimate.
+        Keeps alpha runs reproducible while giving more realistic pressure than
+        a fixed constant.
+        """
+        base = self._ACTION_TOKEN_COST.get(intent.action, self._ACTION_TOKEN_COST["unknown"])
+
+        content_bonus = 0
+        if intent.content:
+            content_bonus += min(len(intent.content) // 12, 55)
+
+        metadata_bonus = 15 if intent.metadata else 0
+        tool_bonus = 12 if intent.tool else 0
+        role_bonus = 10 if intent.role else 0
+        destructive_bonus = 25 if intent.destructive else 0
+
+        return int(base + content_bonus + metadata_bonus + tool_bonus + role_bonus + destructive_bonus)
 
     def apply_intent(self, context: Context, intent: Intent) -> Context:
         ctx = self.clone_context(context)
@@ -314,8 +412,7 @@ class FastPredictor:
         if intent.role:
             ctx["role"] = intent.role
 
-        # unknown action still consumes context budget
-        ctx["tokens_used"] = int(ctx.get("tokens_used", 0)) + 120
+        ctx["tokens_used"] = int(ctx.get("tokens_used", 0)) + self.estimate_token_cost(intent)
 
         if intent.action == "delete":
             if resource_state.get("backed_up", False):
@@ -388,26 +485,33 @@ class LogicalResidualAuditor:
         self.block_threshold = block_threshold
 
     def _resource_conflict_score(self, a: Intent, b: Intent) -> float:
-        same_resource = a.resource == b.resource and a.resource != "unknown"
+        relation = _resource_relation_label(a.resource, b.resource)
         destructive_pair = a.destructive or b.destructive
-        both_write_like = a.action in {"delete", "write", "rename", "backup"} and b.action in {"delete", "write", "rename", "backup"}
+        both_write_like = (
+            a.action in {"delete", "write", "rename", "backup"}
+            and b.action in {"delete", "write", "rename", "backup"}
+        )
 
         score = 0.0
 
-        if same_resource:
+        if relation == "same":
             score += 0.45
+        elif relation == "hierarchical":
+            score += 0.35
+        elif relation == "sibling":
+            score += 0.18
 
-        if same_resource and destructive_pair:
-            score += 0.30
+        if relation in {"same", "hierarchical"} and destructive_pair:
+            score += 0.25
 
-        if same_resource and a.action == "delete" and b.action in {"backup", "rename", "write", "read"}:
+        if relation in {"same", "hierarchical"} and a.action == "delete" and b.action in {"backup", "rename", "write", "read"}:
             score += 0.20
 
-        if same_resource and b.action == "delete" and a.action in {"backup", "rename", "write", "read"}:
+        if relation in {"same", "hierarchical"} and b.action == "delete" and a.action in {"backup", "rename", "write", "read"}:
             score += 0.20
 
-        if same_resource and both_write_like:
-            score += 0.15
+        if relation in {"same", "hierarchical", "sibling"} and both_write_like:
+            score += 0.12
 
         return _clamp(score)
 
@@ -482,6 +586,29 @@ class LogicalResidualAuditor:
             return "WARN"
         return "SAFE"
 
+    def _actionable_advice(self, severity: str, a: Intent, b: Intent, reasons: List[str]) -> List[str]:
+        advice: List[str] = []
+        relation = _resource_relation_label(a.resource, b.resource)
+
+        if severity == "BLOCK":
+            advice.append(
+                f"Critical conflict around {a.resource if a.resource != 'unknown' else 'the target resource'}. "
+                "Suggest sequential isolation before execution."
+            )
+            advice.append("Require explicit human confirmation before any destructive action proceeds.")
+            if "destructive order asymmetry" in reasons:
+                advice.append("Try manual re-ordering so protective actions run before destructive actions.")
+            if relation == "hierarchical":
+                advice.append("Inspect parent-child path overlap. One action may invalidate the other's subtree.")
+        elif severity == "WARN":
+            advice.append("Potential order-sensitive conflict detected. Review action order before execution.")
+            if relation in {"same", "hierarchical"}:
+                advice.append("Consider locking the shared resource scope to avoid concurrent writes.")
+        else:
+            advice.append("No immediate fuse condition detected. Continue with normal monitoring.")
+
+        return advice
+
     def audit_pair(
         self,
         intent_a: IntentLike,
@@ -505,11 +632,16 @@ class LogicalResidualAuditor:
         )
 
         reasons: List[str] = []
+        relation = _resource_relation_label(a.resource, b.resource)
 
-        if a.resource == b.resource and a.resource != "unknown":
+        if relation == "same":
             reasons.append("shared resource target")
+        elif relation == "hierarchical":
+            reasons.append("hierarchical resource overlap")
+        elif relation == "sibling":
+            reasons.append("shared parent resource scope")
 
-        if a.destructive != b.destructive and a.resource == b.resource:
+        if a.destructive != b.destructive and relation in {"same", "hierarchical"}:
             reasons.append("destructive order asymmetry")
 
         if state_ab.resources != state_ba.resources:
@@ -522,6 +654,7 @@ class LogicalResidualAuditor:
             reasons.append("high context pressure")
 
         severity = self._severity(logical_residual, reasons)
+        actionable_advice = self._actionable_advice(severity, a, b, reasons)
 
         return LogicalResidualReport(
             intent_a=a.to_dict(),
@@ -534,6 +667,7 @@ class LogicalResidualAuditor:
             logical_residual=round(logical_residual, 4),
             severity=severity,
             reasons=reasons,
+            actionable_advice=actionable_advice,
         )
 
     def associative_residual(
@@ -561,7 +695,6 @@ class LogicalResidualAuditor:
         compressed_context = self.predictor.clone_context(current_context)
         compressed_context["tokens_used"] = compressed_context.get("tokens_used", 0) + 0.65 * len(normalized_prior) * 120
 
-        # coarse summary: keep only the latest effect per resource
         latest_by_resource: Dict[str, Intent] = {}
         for intent in normalized_prior:
             latest_by_resource[intent.resource] = intent
@@ -599,7 +732,7 @@ if __name__ == "__main__":
         "max_window": 16000,
     }
 
-    a = {"actor": "user_a", "action": "delete", "resource": "/data/logs"}
+    a = {"actor": "user_a", "action": "delete", "resource": "/data"}
     b = {"actor": "user_b", "action": "backup", "resource": "/data/logs"}
 
     report = compute_logical_residual(a, b, context)
