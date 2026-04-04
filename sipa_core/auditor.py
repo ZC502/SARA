@@ -1,8 +1,8 @@
 """
-SIPA Core - Logical Residual Auditor
-===================================
+SIPA Core - Logical Residual Auditor (v3)
+========================================
 
-Alpha-purpose residual engine for SARA / SIPA Core.
+Alpha/Beta-bridge residual engine for SARA / SIPA Core.
 
 Core idea
 ---------
@@ -11,13 +11,14 @@ the execution order of intents is swapped.
 
     R_logic = d( Φ(s, A, B), Φ(s, B, A) )
 
-Design goals
-------------
-- framework-agnostic
-- no OpenClaw dependency
-- no LLM dependency
-- stdlib only
-- easy to plug into demos first, adapters later
+New in v3
+---------
+- hierarchical resource overlap detection
+- actionable_advice in report
+- dynamic deterministic token estimation
+- uncertainty penalty for destructive unknown-resource actions
+- differentiated delete<->write vs delete<->read weighting
+- lightweight repo-action support (commit / force_push)
 """
 
 from __future__ import annotations
@@ -32,10 +33,6 @@ import re
 Context = Dict[str, Any]
 IntentLike = Union[str, Dict[str, Any], "Intent"]
 
-
-# ============================================================
-# Data models
-# ============================================================
 
 @dataclass
 class Intent:
@@ -83,10 +80,6 @@ class LogicalResidualReport:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-
-# ============================================================
-# Normalization helpers
-# ============================================================
 
 _DELETE_PATTERNS = [
     r"\brm\s+-rf\s+([^\s]+)",
@@ -146,19 +139,16 @@ def _norm_action(action: str) -> str:
         "open": "read",
         "inspect": "read",
         "summarize": "read",
+        "git commit": "commit",
+        "commit": "commit",
+        "git push --force": "force_push",
+        "force_push": "force_push",
+        "push --force": "force_push",
     }
     return aliases.get(action, action)
 
 
 def _normalize_resource_path(resource: str) -> str:
-    """
-    Normalize resource paths conservatively using POSIX rules.
-
-    Examples:
-    - "/data/logs/" -> "/data/logs"
-    - "data/logs"   -> "/data/logs"
-    - ""            -> "unknown"
-    """
     if not resource:
         return "unknown"
 
@@ -172,7 +162,6 @@ def _normalize_resource_path(resource: str) -> str:
     normalized = posixpath.normpath(text)
     if not normalized.startswith("/"):
         normalized = "/" + normalized
-
     return normalized
 
 
@@ -306,7 +295,7 @@ def normalize_intent(intent: IntentLike) -> Intent:
         normalized.resource = _normalize_resource_path(normalized.resource)
         if normalized.target and "://" not in normalized.target:
             normalized.target = _normalize_resource_path(normalized.target)
-        normalized.destructive = normalized.destructive or normalized.action == "delete"
+        normalized.destructive = normalized.destructive or normalized.action in {"delete", "force_push"}
         return normalized
 
     if isinstance(intent, str):
@@ -329,35 +318,22 @@ def normalize_intent(intent: IntentLike) -> Intent:
             destructive=bool(intent.get("destructive", False)),
             metadata=intent.get("metadata"),
         )
-        if normalized.action == "delete":
+        if normalized.action in {"delete", "force_push"}:
             normalized.destructive = True
         return normalized
 
     raise TypeError(f"Unsupported intent type: {type(intent)!r}")
 
 
-# ============================================================
-# Predictor
-# ============================================================
-
 class FastPredictor:
-    """
-    Lightweight execution predictor.
-
-    It does not try to be semantically complete.
-    It only needs to be directionally useful for:
-    - resource clashes
-    - destructive order asymmetry
-    - role drift pressure
-    - action side-effect divergence
-    """
-
     _ACTION_TOKEN_COST = {
         "delete": 190,
         "backup": 165,
         "rename": 135,
         "write": 145,
         "read": 80,
+        "commit": 150,
+        "force_push": 205,
         "unknown": 110,
     }
 
@@ -372,11 +348,6 @@ class FastPredictor:
         return cloned
 
     def estimate_token_cost(self, intent: Intent) -> int:
-        """
-        Dynamic but deterministic token estimate.
-        Keeps alpha runs reproducible while giving more realistic pressure than
-        a fixed constant.
-        """
         base = self._ACTION_TOKEN_COST.get(intent.action, self._ACTION_TOKEN_COST["unknown"])
 
         content_bonus = 0
@@ -399,6 +370,8 @@ class FastPredictor:
             "synced": False,
             "renamed_to": None,
             "writes": 0,
+            "local_commits": 0,
+            "history_rewritten": False,
             "last_actor": None,
         }))
 
@@ -432,7 +405,6 @@ class FastPredictor:
                 warnings.append(f"rename attempted on missing resource: {intent.resource}")
             else:
                 resource_state["renamed_to"] = intent.target or f"{intent.resource}.renamed"
-                resource_state["exists"] = True
 
         elif intent.action == "write":
             if not resource_state.get("exists", True):
@@ -443,6 +415,24 @@ class FastPredictor:
         elif intent.action == "read":
             if not resource_state.get("exists", True):
                 warnings.append(f"read attempted on missing resource: {intent.resource}")
+
+        elif intent.action == "commit":
+            if not resource_state.get("exists", True):
+                warnings.append(f"commit attempted on missing resource: {intent.resource}")
+            else:
+                resource_state["local_commits"] = int(resource_state.get("local_commits", 0)) + 1
+                resource_state["synced"] = False
+
+        elif intent.action == "force_push":
+            if not resource_state.get("exists", True):
+                warnings.append(f"force push attempted on missing resource: {intent.resource}")
+            else:
+                if int(resource_state.get("local_commits", 0)) > 0:
+                    warnings.append(f"force push may overwrite unpublished local history: {intent.resource}")
+                resource_state["history_rewritten"] = True
+                resource_state["synced"] = True
+                resource_state["local_commits"] = 0
+                irreversible_ops += 1
 
         else:
             warnings.append(f"unknown action: {intent.action}")
@@ -469,10 +459,6 @@ class FastPredictor:
         )
 
 
-# ============================================================
-# Residual metrics
-# ============================================================
-
 class LogicalResidualAuditor:
     def __init__(
         self,
@@ -486,12 +472,6 @@ class LogicalResidualAuditor:
 
     def _resource_conflict_score(self, a: Intent, b: Intent) -> float:
         relation = _resource_relation_label(a.resource, b.resource)
-        destructive_pair = a.destructive or b.destructive
-        both_write_like = (
-            a.action in {"delete", "write", "rename", "backup"}
-            and b.action in {"delete", "write", "rename", "backup"}
-        )
-
         score = 0.0
 
         if relation == "same":
@@ -501,14 +481,38 @@ class LogicalResidualAuditor:
         elif relation == "sibling":
             score += 0.18
 
+        both_unknown = a.resource == "unknown" and b.resource == "unknown"
+        if both_unknown and (a.destructive or b.destructive):
+            score += 0.15
+
+        delete_write_like = {"write", "rename", "commit", "force_push"}
+        delete_read_like = {"read"}
+        delete_backup_like = {"backup"}
+
+        if relation in {"same", "hierarchical"}:
+            if a.action == "delete" and b.action in delete_write_like:
+                score += 0.25
+            elif b.action == "delete" and a.action in delete_write_like:
+                score += 0.25
+
+            if a.action == "delete" and b.action in delete_read_like:
+                score += 0.15
+            elif b.action == "delete" and a.action in delete_read_like:
+                score += 0.15
+
+            if a.action == "delete" and b.action in delete_backup_like:
+                score += 0.20
+            elif b.action == "delete" and a.action in delete_backup_like:
+                score += 0.20
+
+        destructive_pair = a.destructive or b.destructive
+        both_write_like = (
+            a.action in {"delete", "write", "rename", "backup", "commit", "force_push"}
+            and b.action in {"delete", "write", "rename", "backup", "commit", "force_push"}
+        )
+
         if relation in {"same", "hierarchical"} and destructive_pair:
-            score += 0.25
-
-        if relation in {"same", "hierarchical"} and a.action == "delete" and b.action in {"backup", "rename", "write", "read"}:
-            score += 0.20
-
-        if relation in {"same", "hierarchical"} and b.action == "delete" and a.action in {"backup", "rename", "write", "read"}:
-            score += 0.20
+            score += 0.22
 
         if relation in {"same", "hierarchical", "sibling"} and both_write_like:
             score += 0.12
@@ -535,13 +539,16 @@ class LogicalResidualAuditor:
             b = state_ba.resources.get(name, {})
 
             local = 0.0
-            local += 0.35 if a.get("exists", True) != b.get("exists", True) else 0.0
-            local += 0.20 if bool(a.get("backed_up", False)) != bool(b.get("backed_up", False)) else 0.0
-            local += 0.15 if bool(a.get("synced", False)) != bool(b.get("synced", False)) else 0.0
-            local += 0.15 if (a.get("renamed_to") or "") != (b.get("renamed_to") or "") else 0.0
+            local += 0.30 if a.get("exists", True) != b.get("exists", True) else 0.0
+            local += 0.18 if bool(a.get("backed_up", False)) != bool(b.get("backed_up", False)) else 0.0
+            local += 0.12 if bool(a.get("synced", False)) != bool(b.get("synced", False)) else 0.0
+            local += 0.12 if (a.get("renamed_to") or "") != (b.get("renamed_to") or "") else 0.0
+            local += 0.12 if bool(a.get("history_rewritten", False)) != bool(b.get("history_rewritten", False)) else 0.0
 
             write_gap = abs(int(a.get("writes", 0)) - int(b.get("writes", 0)))
-            local += min(write_gap * 0.10, 0.15)
+            commit_gap = abs(int(a.get("local_commits", 0)) - int(b.get("local_commits", 0)))
+            local += min(write_gap * 0.08, 0.10)
+            local += min(commit_gap * 0.10, 0.12)
 
             total += _clamp(local)
 
@@ -597,9 +604,11 @@ class LogicalResidualAuditor:
             )
             advice.append("Require explicit human confirmation before any destructive action proceeds.")
             if "destructive order asymmetry" in reasons:
-                advice.append("Try manual re-ordering so protective actions run before destructive actions.")
+                advice.append("Try manual re-ordering so protective or state-preserving actions run before destructive actions.")
             if relation == "hierarchical":
                 advice.append("Inspect parent-child path overlap. One action may invalidate the other's subtree.")
+            if a.resource == "unknown" and b.resource == "unknown":
+                advice.append("Resource identity is ambiguous. Escalate to manual review instead of assuming safety.")
         elif severity == "WARN":
             advice.append("Potential order-sensitive conflict detected. Review action order before execution.")
             if relation in {"same", "hierarchical"}:
@@ -641,6 +650,9 @@ class LogicalResidualAuditor:
         elif relation == "sibling":
             reasons.append("shared parent resource scope")
 
+        if a.resource == "unknown" and b.resource == "unknown" and (a.destructive or b.destructive):
+            reasons.append("destructive ambiguity under unknown resource identity")
+
         if a.destructive != b.destructive and relation in {"same", "hierarchical"}:
             reasons.append("destructive order asymmetry")
 
@@ -676,17 +688,6 @@ class LogicalResidualAuditor:
         new_intent: IntentLike,
         current_context: Optional[Context] = None,
     ) -> float:
-        """
-        Approximate associative residual for long-running sessions.
-
-        This is a pragmatic MVP metric:
-        1. simulate detailed prior path + new intent
-        2. compress prior path into a coarse summary state
-        3. compare applying new intent to the compressed state
-
-        It is not a formal algebraic associator. It is an engineering proxy
-        for context collapse / role drift / summary-loss risk.
-        """
         normalized_prior = [normalize_intent(x) for x in prior_intents]
         normalized_new = normalize_intent(new_intent)
 
@@ -705,10 +706,6 @@ class LogicalResidualAuditor:
         return round(self._commutative_residual(detailed, compressed), 4)
 
 
-# ============================================================
-# Convenience function
-# ============================================================
-
 def compute_logical_residual(
     intent_a: IntentLike,
     intent_b: IntentLike,
@@ -717,10 +714,6 @@ def compute_logical_residual(
     auditor = LogicalResidualAuditor()
     return auditor.audit_pair(intent_a, intent_b, current_context).to_dict()
 
-
-# ============================================================
-# Example usage
-# ============================================================
 
 if __name__ == "__main__":
     context = {
