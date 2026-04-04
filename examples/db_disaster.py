@@ -1,21 +1,12 @@
 """
-Disaster Demo: delete vs backup
-===============================
+Disaster Demo: delete vs backup (v2)
+====================================
 
 This demo shows how SIPA Core can detect an order-sensitive,
 destructive conflict before irreversible execution.
 
 Run:
-    python examples/db_disaster.py
-
-Expected behavior:
-- computes Logical Residual
-- prints predicted states for A->B and B->A
-- triggers FUSE_BLOWN when residual is high
-- enters a simple human-arbitration loop:
-    force   -> proceed anyway
-    reorder -> try B then A
-    abort   -> terminate safely
+    python examples/db_disaster_v2.py
 """
 
 from __future__ import annotations
@@ -28,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from sipa_core.auditor import LogicalResidualAuditor
+from sipa_core.auditor_v3 import LogicalResidualAuditor
 
 
 def pretty_json(data):
@@ -40,7 +31,7 @@ def print_banner():
     print("SARA  |  Safe Action Residual Arbiter")
     print("SIPA Core  |  Sequential Intent & Planning Auditor")
     print("=" * 68)
-    print("Scenario: delete vs backup on the same resource")
+    print("Scenario: delete parent path vs backup child path")
     print()
 
 
@@ -59,6 +50,11 @@ def print_report(report):
     else:
         print("reasons               : none")
 
+    if report.actionable_advice:
+        print("actionable_advice     :")
+        for tip in report.actionable_advice:
+            print(f"  - {tip}")
+
     print()
     print("[Predicted A -> B]")
     print(pretty_json(report.state_ab))
@@ -76,6 +72,10 @@ def handle_fuse_blown(report):
     print(f"risk_score     : {report.logical_residual:.4f}")
     print("residual_type  : Logical Residual")
     print("recommendation : BLOCK and request human arbitration")
+    if report.actionable_advice:
+        print("advice         :")
+        for tip in report.actionable_advice:
+            print(f"  - {tip}")
     print()
 
     while True:
@@ -108,14 +108,26 @@ def main():
 
     context = {
         "resources": {
+            "/data": {
+                "exists": True,
+                "backed_up": False,
+                "synced": False,
+                "renamed_to": None,
+                "writes": 0,
+                "local_commits": 0,
+                "history_rewritten": False,
+                "last_actor": None,
+            },
             "/data/logs": {
                 "exists": True,
                 "backed_up": False,
                 "synced": False,
                 "renamed_to": None,
                 "writes": 0,
+                "local_commits": 0,
+                "history_rewritten": False,
                 "last_actor": None,
-            }
+            },
         },
         "role": "ops-assistant",
         "tokens_used": 2400,
@@ -125,8 +137,8 @@ def main():
     intent_a = {
         "actor": "user_a",
         "action": "delete",
-        "resource": "/data/logs",
-        "content": "rm -rf /data/logs",
+        "resource": "/data",
+        "content": "rm -rf /data",
         "destructive": True,
     }
 
@@ -154,7 +166,7 @@ def main():
             print()
             print("[Execution Trace]")
             print("A -> B executed.")
-            print("Potential consequence: backup may fail because the resource is gone.")
+            print("Potential consequence: child backup may fail because the parent path has been removed.")
 
         elif decision == "reorder":
             reordered = auditor.audit_pair(intent_b, intent_a, context)
@@ -163,7 +175,7 @@ def main():
             print_report(reordered)
             print("[Execution Trace]")
             print("B -> A executed.")
-            print("Backup occurs before delete. Data-loss risk is lower, but operation remains destructive.")
+            print("Backup occurs first. Data-loss risk is lower, but the later delete remains destructive.")
 
         elif decision == "abort":
             print()
